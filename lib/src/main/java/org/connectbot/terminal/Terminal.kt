@@ -3044,13 +3044,23 @@ internal fun TerminalWithAccessibility(
                         // prefix ends: skip leading spaces, then find the first
                         // space after URL-safe content.
                         val urlEndCol = if (row in urlContinuationRows) {
-                            val cells = line.cells
-                            var i = 0
-                            // Skip leading spaces (left margin padding)
-                            while (i < cells.size && cells[i].char == ' ') i++
-                            // Advance through URL-safe characters
-                            while (i < cells.size && cells[i].char.isUrlSafe()) i++
-                            i
+                            // Run-based scan: skip leading spaces, then count
+                            // URL-safe chars. Never materializes per-cell data.
+                            var col = 0
+                            var skippingSpaces = true
+                            loop@ for (run in line.runs) {
+                                for (ch in run.text) {
+                                    if (skippingSpaces) {
+                                        if (ch == ' ') {
+                                            col++
+                                            continue
+                                        }
+                                        skippingSpaces = false
+                                    }
+                                    if (ch.isUrlSafe()) col++ else break@loop
+                                }
+                            }
+                            col
                         } else {
                             0
                         }
@@ -3460,35 +3470,93 @@ private fun DrawScope.drawLine(
     val behindBackground = line.images.filter { it.z < -1_073_741_824 }
     behindBackground.forEach { it.draw(drawContext.canvas.nativeCanvas, row, charWidth, charHeight) }
 
-    // Per-column left edges, computed once for both passes. A shared mutable
-    // running offset made the text pass start where the background pass ended
-    // when the line render was split for the image bands — every glyph drew
-    // past the viewport's right edge and text vanished while cell colours
-    // stayed put. Both passes read this one array instead.
-    val cellLeft = FloatArray(line.cells.size + 1)
-    for (i in line.cells.indices) {
-        cellLeft[i + 1] = cellLeft[i] + charWidth * line.cells[i].width
+    // Selected column interval for this row (inclusive bounds), computed once
+    // per row from the same SelectionRange semantics as the old per-cell
+    // isCellSelected(row, col, line) — see SelectionManager.kt.
+    val selStart: Int
+    val selEnd: Int
+    val selRange = selectionManager.selectionRange
+    val selMode = selectionManager.mode
+    if (selRange != null && selMode == SelectionMode.LINE) {
+        val minRow = minOf(selRange.startRow, selRange.endRow)
+        val maxRow = maxOf(selRange.startRow, selRange.endRow)
+        if (row in minRow..maxRow) {
+            selStart = 0
+            selEnd = line.cellCount - 1
+        } else {
+            selStart = -1
+            selEnd = -2
+        }
+    } else if (selRange != null &&
+        (selMode == SelectionMode.CHARACTER || selMode == SelectionMode.WORD)
+    ) {
+        val minRow = minOf(selRange.startRow, selRange.endRow)
+        val maxRow = maxOf(selRange.startRow, selRange.endRow)
+        var lo = -1
+        var hi = -2
+        if (row in minRow..maxRow) {
+            val last = lastContentColRuns(line)
+            if (selRange.startRow == selRange.endRow) {
+                lo = minOf(selRange.startCol, selRange.endCol)
+                hi = maxOf(selRange.startCol, selRange.endCol)
+            } else {
+                lo = when (row) {
+                    minRow -> if (selRange.startRow < selRange.endRow) selRange.startCol else selRange.endCol
+                    else -> 0
+                }
+                hi = when (row) {
+                    maxRow -> if (selRange.startRow < selRange.endRow) selRange.endCol else selRange.startCol
+                    else -> last
+                }
+            }
+            hi = minOf(hi, last)
+            if (hi < lo) {
+                lo = -1
+                hi = -2
+            }
+        }
+        selStart = lo
+        selEnd = hi
+    } else {
+        selStart = -1
+        selEnd = -2
     }
 
-    // Background rectangles
-    line.cells.forEachIndexed { col, cell ->
-        val cellWidth = charWidth * cell.width
-
-        // Check if this cell is selected
-        val isSelected = selectionManager.isCellSelected(row, col, line)
-
-        // Determine background colors (handle reverse video and selection)
-        val bgColor = if (cell.reverse) cell.fgColor else cell.bgColor
-
-        // Draw background (with selection highlight)
-        val finalBgColor = if (isSelected) selectionBackgroundColor else bgColor
-        if (finalBgColor != defaultBg || isSelected) {
-            drawRect(
-                color = finalBgColor,
-                topLeft = Offset(cellLeft[col], y),
-                size = Size(cellWidth, charHeight),
-            )
+    // Background rectangles — one rect per run (style is uniform per run,
+    // including reverse video), split only where the selection intersects.
+    var x = 0f
+    var runStartCol = 0
+    for (run in line.runs) {
+        val runEndCol = runStartCol + run.cellCount
+        val runWidthPx = runPxWidth(run, charWidth, 0, run.cellCount)
+        val s = run.style
+        val baseBg = if (s.reverse) {
+            ColorCache.get(s.fgRed, s.fgGreen, s.fgBlue)
+        } else {
+            ColorCache.get(s.bgRed, s.bgGreen, s.bgBlue)
         }
+
+        val sStart = maxOf(runStartCol, selStart)
+        val sEnd = minOf(runEndCol - 1, selEnd)
+        if (sStart <= sEnd) {
+            val selPxStart = x + runPxWidth(run, charWidth, 0, sStart - runStartCol)
+            val selPxEnd = x + runPxWidth(run, charWidth, 0, sEnd - runStartCol + 1)
+            if (sStart > runStartCol && baseBg != defaultBg) {
+                drawRect(baseBg, Offset(x, y), Size(selPxStart - x, charHeight))
+            }
+            drawRect(
+                color = selectionBackgroundColor,
+                topLeft = Offset(selPxStart, y),
+                size = Size(selPxEnd - selPxStart, charHeight),
+            )
+            if (sEnd < runEndCol - 1 && baseBg != defaultBg) {
+                drawRect(baseBg, Offset(selPxEnd, y), Size(x + runWidthPx - selPxEnd, charHeight))
+            }
+        } else if (baseBg != defaultBg) {
+            drawRect(baseBg, Offset(x, y), Size(runWidthPx, charHeight))
+        }
+        x += runWidthPx
+        runStartCol = runEndCol
     }
 
     // Inline images drawn above the background rectangles but below the text
@@ -3496,74 +3564,285 @@ private fun DrawScope.drawLine(
         it.draw(drawContext.canvas.nativeCanvas, row, charWidth, charHeight)
     }
 
-    // Text
-    line.cells.forEachIndexed { col, cell ->
-        val cellWidth = charWidth * cell.width
+    // Text — iterates runs directly. Runs are split into spans only at
+    // selection / hyperlink boundaries; the fast path (no combining chars,
+    // no double-width cells, underline <= 1) draws each span with a single
+    // drawText call and never materializes per-cell objects.
+    val hyperSpans = hyperlinkSpans(line, autoDetectUrls, isUrlContinuation, urlContinuationEndCol)
+    x = 0f
+    runStartCol = 0
+    for (run in line.runs) {
+        val n = run.cellCount
+        val s = run.style
 
-        // Check if this cell is selected
-        val isSelected = selectionManager.isCellSelected(row, col, line)
+        // Kitty placeholder runs (#583) are drawn via line.images, not text.
+        if (run.imageId != 0L) {
+            x += runPxWidth(run, charWidth, 0, n)
+            runStartCol += n
+            continue
+        }
 
-        // Check if this cell is part of a hyperlink.
-        // For URL continuation rows, only underline the leading URL-safe
-        // prefix (spaces are allowed at the left/right terminal margins
-        // where wrapping occurs, but a mid-line space ends the URL).
-        val isHyperlink = line.getHyperlinkUrlAt(col, autoDetectUrls) != null ||
-            (isUrlContinuation && col < urlContinuationEndCol)
+        val baseFg = if (s.reverse) {
+            ColorCache.get(s.bgRed, s.bgGreen, s.bgBlue)
+        } else {
+            ColorCache.get(s.fgRed, s.fgGreen, s.fgBlue)
+        }
 
-        // Determine colors (handle reverse video and selection)
-        val baseFgColor = if (cell.reverse) cell.bgColor else cell.fgColor
+        if (run.widths != null || run.combining != null || s.underline >= 2) {
+            // Per-cell path for the rare cases (double-width, combining,
+            // double/curly underline) — preserves the old rendering exactly
+            // without allocating Cell objects.
+            var px = x
+            for (i in 0 until n) {
+                val col = runStartCol + i
+                val cellWidth = charWidth * run.widthAt(i)
+                val ch = run.text[i]
+                val combining = run.combiningAt(i)
+                if (ch != ' ' || combining.isNotEmpty()) {
+                    val glyph = if (combining.isEmpty()) {
+                        ch.toString()
+                    } else {
+                        buildString {
+                            append(ch)
+                            combining.forEach { append(it) }
+                        }
+                    }
+                    val isSelected = col in selStart..selEnd
+                    val fgColor = if (isSelected) selectionForegroundColor else baseFg
+                    val isHyperlink = hyperSpans.any { col in it.start until it.end }
 
-        // Draw character
-        if ((cell.char != ' ' || cell.combiningChars.isNotEmpty()) && !cell.isImagePlaceholder) {
-            val text = buildString {
-                append(cell.char)
-                cell.combiningChars.forEach { append(it) }
+                    textPaint.color = fgColor.toArgb()
+                    textPaint.isFakeBoldText = s.bold
+                    textPaint.textSkewX = if (s.italic) -0.25f else 0f
+                    textPaint.isUnderlineText = s.underline == 1 || isHyperlink
+                    textPaint.isStrikeThruText = s.strike
+
+                    drawContext.canvas.nativeCanvas.drawText(
+                        glyph,
+                        px,
+                        y + charBaseline,
+                        textPaint,
+                    )
+
+                    if (s.underline == 2) {
+                        drawDoubleUnderline(
+                            x = px,
+                            y = y + charBaseline,
+                            width = cellWidth,
+                            color = fgColor,
+                        )
+                    }
+
+                    if (s.underline == 3) {
+                        drawCurlyUnderline(
+                            x = px,
+                            y = y + charBaseline,
+                            width = cellWidth,
+                            charWidth = charWidth,
+                            color = fgColor,
+                        )
+                    }
+                }
+                px += cellWidth
             }
-
-            // Force high contrast for text on the selection background
-            val fgColor = if (isSelected) selectionForegroundColor else baseFgColor
-
-            // Configure text paint for this cell
-            textPaint.color = fgColor.toArgb()
-            textPaint.isFakeBoldText = cell.bold
-            textPaint.textSkewX = if (cell.italic) -0.25f else 0f
-            // Underline if cell has underline OR if it's a hyperlink
-            textPaint.isUnderlineText = cell.underline == 1 || isHyperlink
-            textPaint.isStrikeThruText = cell.strike
-
-            // Draw text
-            drawContext.canvas.nativeCanvas.drawText(
-                text,
-                cellLeft[col],
-                y + charBaseline,
-                textPaint,
-            )
-
-            // Draw double underline if needed
-            if (cell.underline == 2) {
-                drawDoubleUnderline(
-                    x = cellLeft[col],
-                    y = y + charBaseline,
-                    width = cellWidth,
-                    color = fgColor,
-                )
+        } else {
+            // Fast path: all width-1 cells, no combining, underline <= 1.
+            // Split into spans at selection / hyperlink boundaries; each span
+            // is drawn with one drawText (or word-split when underline or
+            // strike is active, so lines never cross spaces — per-cell
+            // fidelity). No Cell objects are ever created here.
+            val boundaries = ArrayList<Int>(6)
+            val runEndCol = runStartCol + n
+            if (selEnd >= runStartCol && selStart <= runEndCol - 1) {
+                boundaries.add(maxOf(runStartCol, selStart))
+                boundaries.add(minOf(runEndCol, selEnd + 1))
             }
-
-            // Draw curly underline if needed
-            if (cell.underline == 3) {
-                drawCurlyUnderline(
-                    x = cellLeft[col],
-                    y = y + charBaseline,
-                    width = cellWidth,
-                    charWidth = charWidth,
-                    color = fgColor,
-                )
+            for (sp in hyperSpans) {
+                val a = maxOf(runStartCol, sp.start)
+                val b = minOf(runEndCol, sp.end)
+                if (a < b) {
+                    boundaries.add(a)
+                    boundaries.add(b)
+                }
+            }
+            val spans: List<Int> =
+                if (boundaries.isEmpty()) listOf(runStartCol, runEndCol)
+                else boundaries.sorted().map { it.coerceIn(runStartCol, runEndCol) }
+            val text = run.text
+            for (si in 0 until spans.size - 1) {
+                val a = spans[si]
+                val b = spans[si + 1]
+                if (b <= a) continue
+                val relA = a - runStartCol
+                val relB = b - runStartCol
+                val isSelected = a in selStart..selEnd
+                val isHyperlink = hyperSpans.any { a >= it.start && a < it.end }
+                val underlined = s.underline == 1 || isHyperlink
+                if (underlined || s.strike) {
+                    var i = relA
+                    while (i < relB) {
+                        val wordStart = i
+                        while (i < relB && text[i] != ' ') i++
+                        if (i > wordStart) {
+                            drawRunGlyphSpan(
+                                run = run,
+                                spanStartCol = wordStart,
+                                spanEndCol = i,
+                                xRunPx = x,
+                                baseFg = baseFg,
+                                style = s,
+                                selected = isSelected,
+                                underlined = underlined,
+                                y = y,
+                                charBaseline = charBaseline,
+                                charWidth = charWidth,
+                                textPaint = textPaint,
+                                selectionForegroundColor = selectionForegroundColor,
+                            )
+                        }
+                        while (i < relB && text[i] == ' ') i++
+                    }
+                } else if (hasInk(text, relA, relB)) {
+                    drawRunGlyphSpan(
+                        run = run,
+                        spanStartCol = relA,
+                        spanEndCol = relB,
+                        xRunPx = x,
+                        baseFg = baseFg,
+                        style = s,
+                        selected = isSelected,
+                        underlined = underlined,
+                        y = y,
+                        charBaseline = charBaseline,
+                        charWidth = charWidth,
+                        textPaint = textPaint,
+                        selectionForegroundColor = selectionForegroundColor,
+                    )
+                }
             }
         }
+        x += runPxWidth(run, charWidth, 0, n)
+        runStartCol += n
     }
 
     // Inline images drawn above the text pass
     line.images.filter { it.z >= 0 }.forEach { it.draw(drawContext.canvas.nativeCanvas, row, charWidth, charHeight) }
+}
+
+/** Half-open hyperlink column spans for a row: OSC 8 segments + auto-detected URLs + URL continuation prefix, merged. */
+private fun hyperlinkSpans(
+    line: TerminalLine,
+    autoDetectUrls: Boolean,
+    isUrlContinuation: Boolean,
+    urlContinuationEndCol: Int,
+): List<ColSpan> {
+    val out = ArrayList<ColSpan>(4)
+    for (seg in line.semanticSegments) {
+        if (seg.semanticType == SemanticType.HYPERLINK && seg.endCol > seg.startCol) {
+            out.add(ColSpan(seg.startCol, seg.endCol))
+        }
+    }
+    if (autoDetectUrls) {
+        for ((s, e) in line.autoDetectedUrls) {
+            if (e > s) out.add(ColSpan(s, e))
+        }
+    }
+    if (isUrlContinuation && urlContinuationEndCol > 0) {
+        out.add(ColSpan(0, urlContinuationEndCol))
+    }
+    if (out.size <= 1) return out
+    out.sortBy { it.start }
+    val merged = ArrayList<ColSpan>(out.size)
+    var cur = out[0]
+    for (i in 1 until out.size) {
+        val next = out[i]
+        if (next.start <= cur.end) {
+            if (next.end > cur.end) cur = ColSpan(cur.start, next.end)
+        } else {
+            merged.add(cur)
+            cur = next
+        }
+    }
+    merged.add(cur)
+    return merged
+}
+
+/** Half-open column range [start, end). */
+private data class ColSpan(val start: Int, val end: Int)
+
+/** True when the run's text has any non-space glyph in [from, toExclusive]. */
+private fun hasInk(text: String, from: Int, toExclusive: Int): Boolean {
+    for (i in from until toExclusive) {
+        if (text[i] != ' ') return true
+    }
+    return false
+}
+
+/** Pixel width of a run's cell range [from, toExclusive). O(1) when all cells are width 1. */
+private fun runPxWidth(run: LineRun, charWidth: Float, from: Int, toExclusive: Int): Float {
+    val w = run.widths
+    if (w == null) return (toExclusive - from) * charWidth
+    var sum = 0f
+    for (i in from until toExclusive) {
+        sum += charWidth * (w[i].toInt() and 0xFF)
+    }
+    return sum
+}
+
+/** Index of the last non-blank cell of a line, scanned over runs (no cell materialization). */
+private fun lastContentColRuns(line: TerminalLine): Int {
+    if (line.runs.isEmpty()) return 0
+    var col = line.cellCount - 1
+    var runIdx = line.runs.lastIndex
+    while (runIdx >= 0) {
+        val run = line.runs[runIdx]
+        var local = run.text.lastIndex
+        while (local >= 0) {
+            val ch = run.text[local]
+            val blank = (ch == ' ' || ch == '\u0000') && run.combiningAt(local).isEmpty()
+            if (!blank) return col
+            local--
+            col--
+        }
+        runIdx--
+    }
+    return 0
+}
+
+/**
+ * Draw one glyph span of a fast-path run (all width-1 cells, no combining):
+ * a single drawText over [spanStartCol, spanEndCol) with the run's style.
+ */
+private fun DrawScope.drawRunGlyphSpan(
+    run: LineRun,
+    spanStartCol: Int,
+    spanEndCol: Int,
+    xRunPx: Float,
+    baseFg: Color,
+    style: RunStyle,
+    selected: Boolean,
+    underlined: Boolean,
+    y: Float,
+    charBaseline: Float,
+    charWidth: Float,
+    textPaint: TextPaint,
+    selectionForegroundColor: Color,
+) {
+    val fg = if (selected) selectionForegroundColor else baseFg
+    textPaint.color = fg.toArgb()
+    textPaint.isFakeBoldText = style.bold
+    textPaint.textSkewX = if (style.italic) -0.25f else 0f
+    textPaint.isUnderlineText = underlined
+    textPaint.isStrikeThruText = style.strike
+    // widths are null on the fast path: one char == one cell
+    drawContext.canvas.nativeCanvas.drawText(
+        run.text,
+        spanStartCol,
+        spanEndCol,
+        xRunPx + spanStartCol * charWidth,
+        y + charBaseline,
+        textPaint,
+    )
 }
 
 /**
