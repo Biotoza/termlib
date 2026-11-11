@@ -3651,23 +3651,14 @@ private fun DrawScope.drawLine(
             // is drawn with one drawText (or word-split when underline or
             // strike is active, so lines never cross spaces — per-cell
             // fidelity). No Cell objects are ever created here.
-            val boundaries = ArrayList<Int>(6)
             val runEndCol = runStartCol + n
-            if (selEnd >= runStartCol && selStart <= runEndCol - 1) {
-                boundaries.add(maxOf(runStartCol, selStart))
-                boundaries.add(minOf(runEndCol, selEnd + 1))
-            }
-            for (sp in hyperSpans) {
-                val a = maxOf(runStartCol, sp.start)
-                val b = minOf(runEndCol, sp.end)
-                if (a < b) {
-                    boundaries.add(a)
-                    boundaries.add(b)
-                }
-            }
-            val spans: List<Int> =
-                if (boundaries.isEmpty()) listOf(runStartCol, runEndCol)
-                else boundaries.sorted().map { it.coerceIn(runStartCol, runEndCol) }
+            val spans: List<Int> = runSpanBoundaries(
+                runStartCol = runStartCol,
+                runEndCol = runEndCol,
+                selStart = selStart,
+                selEnd = selEnd,
+                hyperSpans = hyperSpans,
+            )
             val text = run.text
             for (si in 0 until spans.size - 1) {
                 val a = spans[si]
@@ -3729,6 +3720,40 @@ private fun DrawScope.drawLine(
     line.images.filter { it.z >= 0 }.forEach { it.draw(drawContext.canvas.nativeCanvas, row, charWidth, charHeight) }
 }
 
+/**
+ * Column boundaries that split a run into draw spans (half-open intervals
+ * between consecutive entries). The run edges are ALWAYS present so text
+ * outside a selection or hyperlink is still drawn — without them a selection
+ * intersecting the run left only the selection's two points as boundaries and
+ * the unselected text was never drawn (hd7 bug: text disappeared while
+ * selecting, revealing only the selected part). Returns a sorted list within
+ * [runStartCol, runEndCol].
+ */
+internal fun runSpanBoundaries(
+    runStartCol: Int,
+    runEndCol: Int,
+    selStart: Int,
+    selEnd: Int,
+    hyperSpans: List<ColSpan>,
+): List<Int> {
+    val boundaries = ArrayList<Int>(6)
+    boundaries.add(runStartCol)
+    boundaries.add(runEndCol)
+    if (selEnd >= runStartCol && selStart <= runEndCol - 1) {
+        boundaries.add(maxOf(runStartCol, selStart))
+        boundaries.add(minOf(runEndCol, selEnd + 1))
+    }
+    for (sp in hyperSpans) {
+        val a = maxOf(runStartCol, sp.start)
+        val b = minOf(runEndCol, sp.end)
+        if (a < b) {
+            boundaries.add(a)
+            boundaries.add(b)
+        }
+    }
+    return boundaries.sorted().map { it.coerceIn(runStartCol, runEndCol) }.distinct()
+}
+
 /** Half-open hyperlink column spans for a row: OSC 8 segments + auto-detected URLs + URL continuation prefix, merged. */
 private fun hyperlinkSpans(
     line: TerminalLine,
@@ -3768,7 +3793,7 @@ private fun hyperlinkSpans(
 }
 
 /** Half-open column range [start, end). */
-private data class ColSpan(val start: Int, val end: Int)
+internal data class ColSpan(val start: Int, val end: Int)
 
 /** True when the run's text has any non-space glyph in [from, toExclusive]. */
 private fun hasInk(text: String, from: Int, toExclusive: Int): Boolean {
